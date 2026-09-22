@@ -33,12 +33,6 @@ export const ModeSelector: React.FC<ModeSelectorProps> = ({
   ];
 
   const handleSelect = (mode: GameMode) => {
-    if (inActiveOnlineGame && mode !== 'online') {
-      const confirmLeave = window.confirm(
-        'Switching modes will leave your current online game room. Are you sure?'
-      );
-      if (!confirmLeave) return;
-    }
     sounds.playPop();
     onSelectMode(mode);
   };

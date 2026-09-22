@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Play, Plus, RefreshCw, KeyRound, Dices, Copy, Check, Users, Sparkles } from 'lucide-react';
+import { Play, Plus, RefreshCw, KeyRound, Dices, Users, Sparkles, Loader2 } from 'lucide-react';
 import { PublicRoomInfo } from '../types';
 import { sounds } from '../utils/sound';
+import { safeStorage } from '../utils/safeStorage';
 
 interface OnlineLobbyProps {
   onCreateRoom: (playerName: string, isPublic: boolean) => void;
@@ -27,12 +28,13 @@ export const OnlineLobby: React.FC<OnlineLobbyProps> = ({
   clearError,
 }) => {
   const [playerName, setPlayerName] = useState(() => {
-    return localStorage.getItem('ttt_player_name') || FUN_NAMES[Math.floor(Math.random() * FUN_NAMES.length)];
+    return safeStorage.getItem('ttt_player_name') || FUN_NAMES[Math.floor(Math.random() * FUN_NAMES.length)];
   });
   const [joinCode, setJoinCode] = useState('');
   const [publicRooms, setPublicRooms] = useState<PublicRoomInfo[]>([]);
   const [isLoadingRooms, setIsLoadingRooms] = useState(false);
   const [isPublicGame, setIsPublicGame] = useState(true);
+  const [actionLoading, setActionLoading] = useState<'create' | 'quick' | 'join' | null>(null);
 
   // Check URL query parameters for ?room=CODE
   useEffect(() => {
@@ -43,11 +45,18 @@ export const OnlineLobby: React.FC<OnlineLobbyProps> = ({
     }
   }, []);
 
+  // Clear actionLoading if an error occurs
+  useEffect(() => {
+    if (errorMessage) {
+      setActionLoading(null);
+    }
+  }, [errorMessage]);
+
   const randomizeName = () => {
     sounds.playPop();
     const newName = FUN_NAMES[Math.floor(Math.random() * FUN_NAMES.length)];
     setPlayerName(newName);
-    localStorage.setItem('ttt_player_name', newName);
+    safeStorage.setItem('ttt_player_name', newName);
   };
 
   const fetchPublicRooms = async () => {
@@ -74,26 +83,42 @@ export const OnlineLobby: React.FC<OnlineLobbyProps> = ({
   const handleNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value.slice(0, 18);
     setPlayerName(val);
-    localStorage.setItem('ttt_player_name', val);
+    safeStorage.setItem('ttt_player_name', val);
   };
 
-  const handleQuickMatch = () => {
-    if (!playerName.trim()) return;
+  const handleQuickMatch = async () => {
+    const name = playerName.trim() || 'Player';
     sounds.playPop();
-    onQuickMatch(playerName.trim());
+    setActionLoading('quick');
+    try {
+      await onQuickMatch(name);
+    } finally {
+      setTimeout(() => setActionLoading(null), 2500);
+    }
   };
 
-  const handleCreate = () => {
-    if (!playerName.trim()) return;
+  const handleCreate = async () => {
+    const name = playerName.trim() || 'Player 1';
     sounds.playPop();
-    onCreateRoom(playerName.trim(), isPublicGame);
+    setActionLoading('create');
+    try {
+      await onCreateRoom(name, isPublicGame);
+    } finally {
+      setTimeout(() => setActionLoading(null), 2500);
+    }
   };
 
-  const handleJoin = (e?: React.FormEvent) => {
+  const handleJoin = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!joinCode.trim() || !playerName.trim()) return;
+    if (!joinCode.trim()) return;
+    const name = playerName.trim() || 'Guest';
     sounds.playPop();
-    onJoinRoom(joinCode.trim().toUpperCase(), playerName.trim());
+    setActionLoading('join');
+    try {
+      await onJoinRoom(joinCode.trim().toUpperCase(), name);
+    } finally {
+      setTimeout(() => setActionLoading(null), 2500);
+    }
   };
 
   return (
@@ -133,7 +158,7 @@ export const OnlineLobby: React.FC<OnlineLobbyProps> = ({
             id="random-name-btn"
             type="button"
             onClick={randomizeName}
-            className="p-2.5 rounded-xl bg-zinc-100 dark:bg-zinc-700/80 hover:bg-zinc-200 dark:hover:bg-zinc-600 text-zinc-700 dark:text-zinc-200 transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            className="p-2.5 rounded-xl bg-zinc-100 dark:bg-zinc-700/80 hover:bg-zinc-200 dark:hover:bg-zinc-600 text-zinc-700 dark:text-zinc-200 transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer"
             title="Randomize Nickname"
           >
             <Dices className="w-5 h-5" />
@@ -158,12 +183,21 @@ export const OnlineLobby: React.FC<OnlineLobbyProps> = ({
           <button
             id="quick-match-btn"
             type="button"
-            disabled={!isConnected}
+            disabled={actionLoading !== null}
             onClick={handleQuickMatch}
-            className="w-full py-3 px-4 rounded-xl bg-white text-indigo-600 hover:bg-indigo-50 font-bold text-sm shadow-sm transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+            className="w-full py-3 px-4 rounded-xl bg-white text-indigo-600 hover:bg-indigo-50 font-bold text-sm shadow-sm transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-75"
           >
-            <Play className="w-4 h-4 fill-current" />
-            Find Opponent
+            {actionLoading === 'quick' ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />
+                <span>Connecting...</span>
+              </>
+            ) : (
+              <>
+                <Play className="w-4 h-4 fill-current" />
+                <span>Find Opponent</span>
+              </>
+            )}
           </button>
         </div>
 
@@ -185,7 +219,7 @@ export const OnlineLobby: React.FC<OnlineLobbyProps> = ({
                 type="checkbox"
                 checked={isPublicGame}
                 onChange={(e) => setIsPublicGame(e.target.checked)}
-                className="w-4 h-4 rounded text-indigo-600 focus:ring-indigo-500 border-zinc-300 dark:border-zinc-700"
+                className="w-4 h-4 rounded text-indigo-600 focus:ring-indigo-500 border-zinc-300 dark:border-zinc-700 cursor-pointer"
               />
               <span>List in public lobby directory</span>
             </label>
@@ -194,12 +228,21 @@ export const OnlineLobby: React.FC<OnlineLobbyProps> = ({
           <button
             id="create-room-btn"
             type="button"
-            disabled={!isConnected}
+            disabled={actionLoading !== null}
             onClick={handleCreate}
-            className="w-full py-3 px-4 rounded-xl bg-zinc-900 dark:bg-zinc-100 hover:bg-zinc-800 dark:hover:bg-white text-white dark:text-zinc-900 font-bold text-sm shadow-sm transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+            className="w-full py-3 px-4 rounded-xl bg-zinc-900 dark:bg-zinc-100 hover:bg-zinc-800 dark:hover:bg-white text-white dark:text-zinc-900 font-bold text-sm shadow-sm transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-75"
           >
-            <Plus className="w-4 h-4" />
-            Create Game Room
+            {actionLoading === 'create' ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Creating Room...</span>
+              </>
+            ) : (
+              <>
+                <Plus className="w-4 h-4" />
+                <span>Create Game Room</span>
+              </>
+            )}
           </button>
         </div>
       </div>
@@ -223,10 +266,17 @@ export const OnlineLobby: React.FC<OnlineLobbyProps> = ({
           <button
             id="join-room-btn"
             type="submit"
-            disabled={!joinCode.trim() || !isConnected}
-            className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm shadow-sm transition-all disabled:opacity-40 cursor-pointer"
+            disabled={!joinCode.trim() || actionLoading !== null}
+            className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm shadow-sm transition-all disabled:opacity-50 cursor-pointer flex items-center gap-1.5"
           >
-            Join
+            {actionLoading === 'join' ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Joining...</span>
+              </>
+            ) : (
+              <span>Join</span>
+            )}
           </button>
         </form>
       </div>
@@ -248,7 +298,7 @@ export const OnlineLobby: React.FC<OnlineLobbyProps> = ({
             type="button"
             onClick={fetchPublicRooms}
             disabled={isLoadingRooms}
-            className="p-1.5 rounded-lg text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors"
+            className="p-1.5 rounded-lg text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors cursor-pointer"
             title="Refresh room list"
           >
             <RefreshCw className={`w-4 h-4 ${isLoadingRooms ? 'animate-spin text-indigo-600' : ''}`} />

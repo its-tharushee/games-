@@ -23,6 +23,7 @@ export default function App() {
     createRoom,
     joinRoom,
     quickMatch,
+    addBot,
     makeMove,
     requestRematch,
     sendReaction,
@@ -65,6 +66,7 @@ export default function App() {
                 onRequestRematch={requestRematch}
                 onSendReaction={sendReaction}
                 onLeaveRoom={leaveRoom}
+                onAddBot={addBot}
               />
             ) : (
               <OnlineLobby

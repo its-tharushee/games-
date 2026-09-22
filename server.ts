@@ -8,6 +8,8 @@ const PORT = 3000;
 const app = express();
 app.use(express.json());
 
+type PlayerSymbol = 'X' | 'O';
+
 interface ServerPlayer {
   id: string;
   name: string;
@@ -15,6 +17,14 @@ interface ServerPlayer {
   connected: boolean;
   score: number;
   ws?: WebSocket;
+}
+
+interface ReactionItem {
+  id: string;
+  fromName: string;
+  fromSymbol: 'X' | 'O' | 'spectator';
+  emoji: string;
+  timestamp: number;
 }
 
 interface ServerRoom {
@@ -26,7 +36,7 @@ interface ServerRoom {
     X?: ServerPlayer;
     O?: ServerPlayer;
   };
-  spectators: Map<string, { id: string; name: string; ws: WebSocket }>;
+  spectators: Map<string, { id: string; name: string; ws?: WebSocket }>;
   board: ('X' | 'O' | null)[];
   currentTurn: 'X' | 'O';
   status: 'waiting' | 'in_progress' | 'won' | 'draw';
@@ -36,6 +46,7 @@ interface ServerRoom {
   round: number;
   drawCount: number;
   lastMoveIndex: number | null;
+  recentReactions: ReactionItem[];
 }
 
 const WINNING_COMBINATIONS = [
@@ -130,7 +141,7 @@ function broadcastRoom(room: ServerRoom) {
 
   // Send to Spectators
   for (const spectator of room.spectators.values()) {
-    if (spectator.ws.readyState === WebSocket.OPEN) {
+    if (spectator.ws && spectator.ws.readyState === WebSocket.OPEN) {
       spectator.ws.send(JSON.stringify({
         type: 'room_state',
         room: state,
@@ -149,10 +160,409 @@ function broadcastToRoom(room: ServerRoom, payload: unknown) {
     room.players.O.ws.send(message);
   }
   for (const spectator of room.spectators.values()) {
-    if (spectator.ws.readyState === WebSocket.OPEN) {
+    if (spectator.ws && spectator.ws.readyState === WebSocket.OPEN) {
       spectator.ws.send(message);
     }
   }
+}
+
+// Core Room Operations (shared by HTTP REST and WebSockets)
+function createRoomLogic(playerName: string, playerId: string, isPublic: boolean, ws?: WebSocket) {
+  const cleanName = (playerName || 'Player 1').slice(0, 20).trim() || 'Player 1';
+  const cleanId = String(playerId || Math.random().toString(36).slice(2));
+  const code = generateRoomCode();
+
+  const room: ServerRoom = {
+    code,
+    isPublic: Boolean(isPublic),
+    createdAt: Date.now(),
+    lastActivity: Date.now(),
+    players: {
+      X: {
+        id: cleanId,
+        name: cleanName,
+        symbol: 'X',
+        connected: true,
+        score: 0,
+        ws,
+      },
+    },
+    spectators: new Map(),
+    board: Array(9).fill(null),
+    currentTurn: 'X',
+    status: 'waiting',
+    winner: null,
+    winningLine: null,
+    rematchRequestedBy: null,
+    round: 1,
+    drawCount: 0,
+    lastMoveIndex: null,
+    recentReactions: [],
+  };
+
+  rooms.set(code, room);
+  if (ws) {
+    clientMetadata.set(ws, { code, playerId: cleanId, name: cleanName });
+  }
+  broadcastRoom(room);
+  return { code, room: getSanitizedRoomState(room), yourSymbol: 'X' as const };
+}
+
+function joinRoomLogic(code: string, playerName: string, playerId: string, ws?: WebSocket) {
+  const rawCode = String(code || '').toUpperCase().trim();
+  const cleanName = (playerName || 'Guest').slice(0, 20).trim() || 'Guest';
+  const cleanId = String(playerId || Math.random().toString(36).slice(2));
+
+  const room = rooms.get(rawCode);
+  if (!room) {
+    return { error: `Room "${rawCode}" not found. Please check the code.` };
+  }
+
+  room.lastActivity = Date.now();
+  if (ws) {
+    clientMetadata.set(ws, { code: rawCode, playerId: cleanId, name: cleanName });
+  }
+
+  // Check if player is reconnecting
+  if (room.players.X && room.players.X.id === cleanId) {
+    if (ws) room.players.X.ws = ws;
+    room.players.X.connected = true;
+    room.players.X.name = cleanName;
+    broadcastRoom(room);
+    broadcastToRoom(room, {
+      type: 'opponent_reconnected',
+      message: `${cleanName} reconnected to the match.`,
+    });
+    return { code: rawCode, room: getSanitizedRoomState(room), yourSymbol: 'X' as const, yourPlayerId: cleanId };
+  }
+
+  if (room.players.O && room.players.O.id === cleanId) {
+    if (ws) room.players.O.ws = ws;
+    room.players.O.connected = true;
+    room.players.O.name = cleanName;
+    broadcastRoom(room);
+    broadcastToRoom(room, {
+      type: 'opponent_reconnected',
+      message: `${cleanName} reconnected to the match.`,
+    });
+    return { code: rawCode, room: getSanitizedRoomState(room), yourSymbol: 'O' as const, yourPlayerId: cleanId };
+  }
+
+  // Replace AI bot if a human joins the room
+  if (room.players.O && room.players.O.id === 'ai_bot') {
+    room.players.O = {
+      id: cleanId,
+      name: cleanName,
+      symbol: 'O',
+      connected: true,
+      score: 0,
+      ws,
+    };
+    room.lastActivity = Date.now();
+    broadcastRoom(room);
+    broadcastToRoom(room, {
+      type: 'opponent_reconnected',
+      message: `${cleanName} joined and replaced the practice bot!`,
+    });
+    return { code: rawCode, room: getSanitizedRoomState(room), yourSymbol: 'O' as const, yourPlayerId: cleanId };
+  }
+
+  // Check if X slot is open
+  if (!room.players.X) {
+    room.players.X = {
+      id: cleanId,
+      name: cleanName,
+      symbol: 'X',
+      connected: true,
+      score: 0,
+      ws,
+    };
+    if (room.players.O) {
+      room.status = 'in_progress';
+    }
+    broadcastRoom(room);
+    return { code: rawCode, room: getSanitizedRoomState(room), yourSymbol: 'X' as const, yourPlayerId: cleanId };
+  }
+
+  // Check if O slot is open
+  if (!room.players.O) {
+    room.players.O = {
+      id: cleanId,
+      name: cleanName,
+      symbol: 'O',
+      connected: true,
+      score: 0,
+      ws,
+    };
+    room.status = 'in_progress';
+    broadcastRoom(room);
+    return { code: rawCode, room: getSanitizedRoomState(room), yourSymbol: 'O' as const, yourPlayerId: cleanId };
+  }
+
+  // Spectator
+  room.spectators.set(cleanId, { id: cleanId, name: cleanName, ws });
+  broadcastRoom(room);
+  return { code: rawCode, room: getSanitizedRoomState(room), yourSymbol: 'spectator' as const, yourPlayerId: cleanId };
+}
+
+function findBestBotMove(board: (PlayerSymbol | null)[], botSymbol: PlayerSymbol): number {
+  const opponentSymbol: PlayerSymbol = botSymbol === 'X' ? 'O' : 'X';
+
+  // 1. Check if bot can win immediately
+  for (let i = 0; i < 9; i++) {
+    if (board[i] === null) {
+      const copy = [...board];
+      copy[i] = botSymbol;
+      if (checkWinner(copy).winner === botSymbol) return i;
+    }
+  }
+
+  // 2. Block opponent's immediate win
+  for (let i = 0; i < 9; i++) {
+    if (board[i] === null) {
+      const copy = [...board];
+      copy[i] = opponentSymbol;
+      if (checkWinner(copy).winner === opponentSymbol) return i;
+    }
+  }
+
+  // 3. Center tile
+  if (board[4] === null) return 4;
+
+  // 4. Corners
+  const corners = [0, 2, 6, 8].filter((i) => board[i] === null);
+  if (corners.length > 0) {
+    return corners[Math.floor(Math.random() * corners.length)];
+  }
+
+  // 5. Sides
+  const sides = [1, 3, 5, 7].filter((i) => board[i] === null);
+  if (sides.length > 0) {
+    return sides[Math.floor(Math.random() * sides.length)];
+  }
+
+  return -1;
+}
+
+function triggerBotMove(room: ServerRoom) {
+  if (room.status !== 'in_progress' || room.currentTurn !== 'O' || room.players.O?.id !== 'ai_bot') {
+    return;
+  }
+
+  setTimeout(() => {
+    const currentRoom = rooms.get(room.code);
+    if (!currentRoom || currentRoom.status !== 'in_progress' || currentRoom.currentTurn !== 'O') {
+      return;
+    }
+
+    const botMoveIndex = findBestBotMove(currentRoom.board, 'O');
+    if (botMoveIndex !== -1) {
+      makeMoveLogic(currentRoom.code, botMoveIndex, 'ai_bot');
+    }
+  }, 400);
+}
+
+function addBotLogic(code: string) {
+  const rawCode = String(code || '').toUpperCase().trim();
+  const room = rooms.get(rawCode);
+  if (!room) return { error: 'Room not found' };
+
+  if (room.players.O && room.players.O.id !== 'ai_bot' && room.players.O.connected) {
+    return { error: 'Player 2 is already connected' };
+  }
+
+  room.players.O = {
+    id: 'ai_bot',
+    name: 'TicTacBot (AI)',
+    symbol: 'O',
+    connected: true,
+    score: 0,
+  };
+  room.status = 'in_progress';
+  room.lastActivity = Date.now();
+  broadcastRoom(room);
+
+  if (room.currentTurn === 'O') {
+    triggerBotMove(room);
+  }
+
+  return { room: getSanitizedRoomState(room) };
+}
+
+function quickMatchLogic(playerName: string, playerId: string, ws?: WebSocket) {
+  const cleanName = (playerName || 'Player').slice(0, 20).trim() || 'Player';
+  const cleanId = String(playerId || Math.random().toString(36).slice(2));
+
+  // Find open waiting public room
+  for (const room of rooms.values()) {
+    if (room.isPublic && room.status === 'waiting' && room.players.X && !room.players.O && room.players.X.id !== cleanId) {
+      room.players.O = {
+        id: cleanId,
+        name: cleanName,
+        symbol: 'O',
+        connected: true,
+        score: 0,
+        ws,
+      };
+      room.status = 'in_progress';
+      room.lastActivity = Date.now();
+      if (ws) {
+        clientMetadata.set(ws, { code: room.code, playerId: cleanId, name: cleanName });
+      }
+      broadcastRoom(room);
+      return { code: room.code, room: getSanitizedRoomState(room), yourSymbol: 'O' as const };
+    }
+  }
+
+  // If no room found, create one
+  return createRoomLogic(cleanName, cleanId, true, ws);
+}
+
+function makeMoveLogic(code: string, index: number, playerId: string) {
+  const rawCode = String(code || '').toUpperCase().trim();
+  const room = rooms.get(rawCode);
+  if (!room) return { error: 'Room not found' };
+
+  if (room.status !== 'in_progress') return { error: 'Game is not in progress' };
+  if (index < 0 || index > 8 || room.board[index] !== null) return { error: 'Invalid move' };
+
+  const isPlayerX = room.players.X?.id === playerId;
+  const isPlayerO = room.players.O?.id === playerId;
+  if (!isPlayerX && !isPlayerO) return { error: 'Not a player in this match' };
+
+  const playerSymbol = isPlayerX ? 'X' : 'O';
+  if (room.currentTurn !== playerSymbol) return { error: 'Not your turn' };
+
+  // Apply move
+  room.board[index] = playerSymbol;
+  room.lastMoveIndex = index;
+  room.lastActivity = Date.now();
+
+  const { winner, winningLine } = checkWinner(room.board);
+
+  if (winner) {
+    room.status = 'won';
+    room.winner = winner;
+    room.winningLine = winningLine;
+    if (winner === 'X' && room.players.X) {
+      room.players.X.score += 1;
+    } else if (winner === 'O' && room.players.O) {
+      room.players.O.score += 1;
+    }
+  } else if (room.board.every((c) => c !== null)) {
+    room.status = 'draw';
+    room.drawCount += 1;
+  } else {
+    room.currentTurn = room.currentTurn === 'X' ? 'O' : 'X';
+  }
+
+  broadcastRoom(room);
+
+  // If next turn is AI bot, trigger its move
+  if (room.status === 'in_progress' && room.currentTurn === 'O' && room.players.O?.id === 'ai_bot') {
+    triggerBotMove(room);
+  }
+
+  return { room: getSanitizedRoomState(room) };
+}
+
+function rematchLogic(code: string, playerId: string) {
+  const rawCode = String(code || '').toUpperCase().trim();
+  const room = rooms.get(rawCode);
+  if (!room) return { error: 'Room not found' };
+  if (room.status !== 'won' && room.status !== 'draw') return { error: 'Round still active' };
+
+  // If opponent is AI bot, bot accepts rematch immediately
+  if (room.players.O?.id === 'ai_bot') {
+    room.board = Array(9).fill(null);
+    room.status = 'in_progress';
+    room.winner = null;
+    room.winningLine = null;
+    room.rematchRequestedBy = null;
+    room.lastMoveIndex = null;
+    room.round += 1;
+    room.currentTurn = room.round % 2 === 1 ? 'X' : 'O';
+    room.lastActivity = Date.now();
+    broadcastRoom(room);
+
+    if (room.currentTurn === 'O') {
+      triggerBotMove(room);
+    }
+    return { room: getSanitizedRoomState(room) };
+  }
+
+  if (!room.rematchRequestedBy) {
+    room.rematchRequestedBy = playerId;
+    broadcastRoom(room);
+  } else if (room.rematchRequestedBy !== playerId) {
+    room.board = Array(9).fill(null);
+    room.status = 'in_progress';
+    room.winner = null;
+    room.winningLine = null;
+    room.rematchRequestedBy = null;
+    room.lastMoveIndex = null;
+    room.round += 1;
+    room.currentTurn = room.round % 2 === 1 ? 'X' : 'O';
+    room.lastActivity = Date.now();
+    broadcastRoom(room);
+  }
+
+  return { room: getSanitizedRoomState(room) };
+}
+
+function reactionLogic(code: string, playerId: string, emoji: string) {
+  const rawCode = String(code || '').toUpperCase().trim();
+  const room = rooms.get(rawCode);
+  if (!room) return { error: 'Room not found' };
+
+  const cleanEmoji = String(emoji || '👍').slice(0, 5);
+  let fromName = 'Player';
+  let fromSymbol: 'X' | 'O' | 'spectator' = 'spectator';
+
+  if (room.players.X?.id === playerId) {
+    fromName = room.players.X.name;
+    fromSymbol = 'X';
+  } else if (room.players.O?.id === playerId) {
+    fromName = room.players.O.name;
+    fromSymbol = 'O';
+  } else if (room.spectators.has(playerId)) {
+    fromName = room.spectators.get(playerId)!.name;
+  }
+
+  const reactionItem: ReactionItem = {
+    id: `${Date.now()}-${Math.random()}`,
+    fromName,
+    fromSymbol,
+    emoji: cleanEmoji,
+    timestamp: Date.now(),
+  };
+
+  room.recentReactions.push(reactionItem);
+  const cutoff = Date.now() - 10000;
+  room.recentReactions = room.recentReactions.filter((r) => r.timestamp > cutoff);
+
+  broadcastToRoom(room, {
+    type: 'reaction',
+    ...reactionItem,
+  });
+
+  // If opponent is AI bot, send a fun reaction reply
+  if (room.players.O?.id === 'ai_bot') {
+    setTimeout(() => {
+      const botEmojis = ['🤖', '🔥', '⚡', '😎', '👏'];
+      const pick = botEmojis[Math.floor(Math.random() * botEmojis.length)];
+      broadcastToRoom(room, {
+        type: 'reaction',
+        id: `${Date.now()}-bot`,
+        fromName: 'TicTacBot (AI)',
+        fromSymbol: 'O',
+        emoji: pick,
+        timestamp: Date.now(),
+      });
+    }, 700);
+  }
+
+  return { ok: true, reaction: reactionItem };
 }
 
 // REST Endpoints
@@ -165,7 +575,6 @@ app.get('/api/public-rooms', (req, res) => {
   const now = Date.now();
   for (const room of rooms.values()) {
     if (room.isPublic && room.status === 'waiting' && room.players.X && !room.players.O) {
-      // Only rooms active within 15 minutes
       if (now - room.lastActivity < 15 * 60 * 1000) {
         publicRooms.push({
           code: room.code,
@@ -178,13 +587,116 @@ app.get('/api/public-rooms', (req, res) => {
   res.json({ rooms: publicRooms });
 });
 
+app.post('/api/rooms', (req, res) => {
+  const { playerName, playerId, isPublic } = req.body;
+  const result = createRoomLogic(playerName, playerId, isPublic);
+  res.json(result);
+});
+
+app.post('/api/rooms/quick-match', (req, res) => {
+  const { playerName, playerId } = req.body;
+  const result = quickMatchLogic(playerName, playerId);
+  res.json(result);
+});
+
+app.post('/api/rooms/:code/join', (req, res) => {
+  const { code } = req.params;
+  const { playerName, playerId } = req.body;
+  const result = joinRoomLogic(code, playerName, playerId);
+  if ('error' in result) {
+    res.status(400).json(result);
+  } else {
+    res.json(result);
+  }
+});
+
+app.get('/api/rooms/:code', (req, res) => {
+  const { code } = req.params;
+  const room = rooms.get(String(code).toUpperCase().trim());
+  if (!room) {
+    res.status(404).json({ error: 'Room not found' });
+    return;
+  }
+  const cutoff = Date.now() - 8000;
+  res.json({
+    room: getSanitizedRoomState(room),
+    reactions: room.recentReactions.filter((r) => r.timestamp > cutoff),
+  });
+});
+
+app.post('/api/rooms/:code/move', (req, res) => {
+  const { code } = req.params;
+  const { index, playerId } = req.body;
+  const result = makeMoveLogic(code, Number(index), String(playerId));
+  if ('error' in result) {
+    res.status(400).json(result);
+  } else {
+    res.json(result);
+  }
+});
+
+app.post('/api/rooms/:code/rematch', (req, res) => {
+  const { code } = req.params;
+  const { playerId } = req.body;
+  const result = rematchLogic(code, String(playerId));
+  if ('error' in result) {
+    res.status(400).json(result);
+  } else {
+    res.json(result);
+  }
+});
+
+app.post('/api/rooms/:code/reaction', (req, res) => {
+  const { code } = req.params;
+  const { playerId, emoji } = req.body;
+  const result = reactionLogic(code, String(playerId), String(emoji));
+  res.json(result);
+});
+
+app.post('/api/rooms/:code/bot', (req, res) => {
+  const { code } = req.params;
+  const result = addBotLogic(code);
+  if ('error' in result) {
+    res.status(400).json(result);
+  } else {
+    res.json(result);
+  }
+});
+
+app.post('/api/rooms/:code/leave', (req, res) => {
+  const { code } = req.params;
+  const { playerId } = req.body;
+  const room = rooms.get(String(code).toUpperCase().trim());
+  if (room) {
+    if (room.players.X && room.players.X.id === playerId) {
+      room.players.X.connected = false;
+      broadcastRoom(room);
+      broadcastToRoom(room, {
+        type: 'opponent_disconnected',
+        message: `${room.players.X.name} left the match.`,
+      });
+    } else if (room.players.O && room.players.O.id === playerId) {
+      room.players.O.connected = false;
+      broadcastRoom(room);
+      broadcastToRoom(room, {
+        type: 'opponent_disconnected',
+        message: `${room.players.O.name} left the match.`,
+      });
+    } else if (room.spectators.has(playerId)) {
+      room.spectators.delete(playerId);
+      broadcastRoom(room);
+    }
+  }
+  res.json({ ok: true });
+});
+
 async function startServer() {
   const server = http.createServer(app);
   const wss = new WebSocketServer({ noServer: true });
 
   server.on('upgrade', (request, socket, head) => {
-    const { pathname } = new URL(request.url || '', `http://${request.headers.host}`);
-    if (pathname === '/ws') {
+    const url = request.url || '';
+    if (url === '/ws' || url.startsWith('/ws?') || url.startsWith('/ws/')) {
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
       });
@@ -213,267 +725,63 @@ async function startServer() {
   });
 
   function handleClientMessage(ws: WebSocket, msg: { type: string; [key: string]: unknown }) {
-    const meta = clientMetadata.get(ws) || {};
-
     switch (msg.type) {
       case 'create_room': {
-        const playerName = (String(msg.playerName || 'Player 1')).slice(0, 20).trim() || 'Player 1';
-        const playerId = String(msg.playerId || Math.random().toString(36).slice(2));
-        const isPublic = Boolean(msg.isPublic);
-
-        const code = generateRoomCode();
-        const room: ServerRoom = {
-          code,
-          isPublic,
-          createdAt: Date.now(),
-          lastActivity: Date.now(),
-          players: {
-            X: {
-              id: playerId,
-              name: playerName,
-              symbol: 'X',
-              connected: true,
-              score: 0,
-              ws,
-            },
-          },
-          spectators: new Map(),
-          board: Array(9).fill(null),
-          currentTurn: 'X',
-          status: 'waiting',
-          winner: null,
-          winningLine: null,
-          rematchRequestedBy: null,
-          round: 1,
-          drawCount: 0,
-          lastMoveIndex: null,
-        };
-
-        rooms.set(code, room);
-        clientMetadata.set(ws, { code, playerId, name: playerName });
-        broadcastRoom(room);
+        createRoomLogic(
+          String(msg.playerName || ''),
+          String(msg.playerId || ''),
+          Boolean(msg.isPublic),
+          ws
+        );
         break;
       }
-
       case 'quick_match': {
-        const playerName = (String(msg.playerName || 'Player')).slice(0, 20).trim() || 'Player';
-        const playerId = String(msg.playerId || Math.random().toString(36).slice(2));
-
-        // Find existing public waiting room
-        let joined = false;
-        for (const room of rooms.values()) {
-          if (room.isPublic && room.status === 'waiting' && room.players.X && !room.players.O && room.players.X.id !== playerId) {
-            room.players.O = {
-              id: playerId,
-              name: playerName,
-              symbol: 'O',
-              connected: true,
-              score: 0,
-              ws,
-            };
-            room.status = 'in_progress';
-            room.lastActivity = Date.now();
-            rooms.set(room.code, room);
-            clientMetadata.set(ws, { code: room.code, playerId, name: playerName });
-            broadcastRoom(room);
-            joined = true;
-            break;
-          }
-        }
-
-        if (!joined) {
-          // Create public room
-          handleClientMessage(ws, {
-            type: 'create_room',
-            playerName,
-            playerId,
-            isPublic: true,
-          });
-        }
+        quickMatchLogic(
+          String(msg.playerName || ''),
+          String(msg.playerId || ''),
+          ws
+        );
         break;
       }
-
       case 'join_room': {
-        const rawCode = String(msg.code || '').toUpperCase().trim();
-        const playerName = (String(msg.playerName || 'Guest')).slice(0, 20).trim() || 'Guest';
-        const playerId = String(msg.playerId || Math.random().toString(36).slice(2));
-
-        const room = rooms.get(rawCode);
-        if (!room) {
-          ws.send(JSON.stringify({ type: 'error', message: `Room "${rawCode}" does not exist.` }));
-          return;
+        const res = joinRoomLogic(
+          String(msg.code || ''),
+          String(msg.playerName || ''),
+          String(msg.playerId || ''),
+          ws
+        );
+        if ('error' in res) {
+          ws.send(JSON.stringify({ type: 'error', message: res.error }));
         }
-
-        room.lastActivity = Date.now();
-        clientMetadata.set(ws, { code: rawCode, playerId, name: playerName });
-
-        // Check if player is reconnecting
-        if (room.players.X && room.players.X.id === playerId) {
-          room.players.X.ws = ws;
-          room.players.X.connected = true;
-          room.players.X.name = playerName;
-          broadcastRoom(room);
-          broadcastToRoom(room, {
-            type: 'opponent_reconnected',
-            message: `${playerName} reconnected to the match.`,
-          });
-          return;
-        }
-
-        if (room.players.O && room.players.O.id === playerId) {
-          room.players.O.ws = ws;
-          room.players.O.connected = true;
-          room.players.O.name = playerName;
-          broadcastRoom(room);
-          broadcastToRoom(room, {
-            type: 'opponent_reconnected',
-            message: `${playerName} reconnected to the match.`,
-          });
-          return;
-        }
-
-        // Check if X slot is open
-        if (!room.players.X) {
-          room.players.X = {
-            id: playerId,
-            name: playerName,
-            symbol: 'X',
-            connected: true,
-            score: 0,
-            ws,
-          };
-          if (room.players.O) {
-            room.status = 'in_progress';
-          }
-          broadcastRoom(room);
-          return;
-        }
-
-        // Check if O slot is open
-        if (!room.players.O) {
-          room.players.O = {
-            id: playerId,
-            name: playerName,
-            symbol: 'O',
-            connected: true,
-            score: 0,
-            ws,
-          };
-          room.status = 'in_progress';
-          broadcastRoom(room);
-          return;
-        }
-
-        // Otherwise spectator
-        room.spectators.set(playerId, { id: playerId, name: playerName, ws });
-        broadcastRoom(room);
         break;
       }
-
       case 'make_move': {
-        const rawCode = String(msg.code || '').toUpperCase().trim();
-        const index = Number(msg.index);
-        const playerId = String(msg.playerId);
-
-        const room = rooms.get(rawCode);
-        if (!room) return;
-
-        if (room.status !== 'in_progress') return;
-        if (index < 0 || index > 8 || room.board[index] !== null) return;
-
-        const isPlayerX = room.players.X?.id === playerId;
-        const isPlayerO = room.players.O?.id === playerId;
-
-        if (!isPlayerX && !isPlayerO) return;
-
-        const playerSymbol = isPlayerX ? 'X' : 'O';
-        if (room.currentTurn !== playerSymbol) return;
-
-        // Apply move
-        room.board[index] = playerSymbol;
-        room.lastMoveIndex = index;
-        room.lastActivity = Date.now();
-
-        const { winner, winningLine } = checkWinner(room.board);
-
-        if (winner) {
-          room.status = 'won';
-          room.winner = winner;
-          room.winningLine = winningLine;
-          if (winner === 'X' && room.players.X) {
-            room.players.X.score += 1;
-          } else if (winner === 'O' && room.players.O) {
-            room.players.O.score += 1;
-          }
-        } else if (room.board.every((c) => c !== null)) {
-          room.status = 'draw';
-          room.drawCount += 1;
-        } else {
-          room.currentTurn = room.currentTurn === 'X' ? 'O' : 'X';
-        }
-
-        broadcastRoom(room);
+        makeMoveLogic(
+          String(msg.code || ''),
+          Number(msg.index),
+          String(msg.playerId || '')
+        );
         break;
       }
-
       case 'request_rematch': {
-        const rawCode = String(msg.code || '').toUpperCase().trim();
-        const playerId = String(msg.playerId);
-        const room = rooms.get(rawCode);
-        if (!room) return;
-
-        if (room.status !== 'won' && room.status !== 'draw') return;
-
-        if (!room.rematchRequestedBy) {
-          room.rematchRequestedBy = playerId;
-          broadcastRoom(room);
-        } else if (room.rematchRequestedBy !== playerId) {
-          // Opponent agreed! Start fresh round
-          room.board = Array(9).fill(null);
-          room.status = 'in_progress';
-          room.winner = null;
-          room.winningLine = null;
-          room.rematchRequestedBy = null;
-          room.lastMoveIndex = null;
-          room.round += 1;
-          // Alternate starting turn on every round
-          room.currentTurn = room.round % 2 === 1 ? 'X' : 'O';
-          room.lastActivity = Date.now();
-          broadcastRoom(room);
-        }
+        rematchLogic(
+          String(msg.code || ''),
+          String(msg.playerId || '')
+        );
         break;
       }
-
       case 'send_reaction': {
-        const rawCode = String(msg.code || '').toUpperCase().trim();
-        const playerId = String(msg.playerId);
-        const emoji = String(msg.emoji || '👍').slice(0, 5);
-        const room = rooms.get(rawCode);
-        if (!room) return;
-
-        let fromName = 'Player';
-        let fromSymbol: 'X' | 'O' | 'spectator' = 'spectator';
-
-        if (room.players.X?.id === playerId) {
-          fromName = room.players.X.name;
-          fromSymbol = 'X';
-        } else if (room.players.O?.id === playerId) {
-          fromName = room.players.O.name;
-          fromSymbol = 'O';
-        } else if (room.spectators.has(playerId)) {
-          fromName = room.spectators.get(playerId)!.name;
-        }
-
-        broadcastToRoom(room, {
-          type: 'reaction',
-          fromName,
-          fromSymbol,
-          emoji,
-          id: `${Date.now()}-${Math.random()}`,
-        });
+        reactionLogic(
+          String(msg.code || ''),
+          String(msg.playerId || ''),
+          String(msg.emoji || '')
+        );
         break;
       }
-
+      case 'add_bot': {
+        addBotLogic(String(msg.code || ''));
+        break;
+      }
       case 'leave_room': {
         handleDisconnect(ws);
         break;
@@ -489,26 +797,25 @@ async function startServer() {
     const room = rooms.get(roomCode);
     if (!room) return;
 
-    if (room.players.X?.id === meta.playerId) {
+    if (room.players.X && room.players.X.id === meta.playerId) {
       room.players.X.connected = false;
       broadcastRoom(room);
       broadcastToRoom(room, {
         type: 'opponent_disconnected',
-        message: `${room.players.X.name} left the room or disconnected.`,
+        message: `${room.players.X.name} disconnected.`,
       });
-    } else if (room.players.O?.id === meta.playerId) {
+    } else if (room.players.O && room.players.O.id === meta.playerId) {
       room.players.O.connected = false;
       broadcastRoom(room);
       broadcastToRoom(room, {
         type: 'opponent_disconnected',
-        message: `${room.players.O.name} left the room or disconnected.`,
+        message: `${room.players.O.name} disconnected.`,
       });
     } else if (room.spectators.has(meta.playerId)) {
       room.spectators.delete(meta.playerId);
       broadcastRoom(room);
     }
 
-    // Clean up empty room after 1 hour of no players
     const bothDisconnected =
       (!room.players.X || !room.players.X.connected) &&
       (!room.players.O || !room.players.O.connected) &&
