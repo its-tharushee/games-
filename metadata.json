@@ -1,0 +1,6 @@
+{
+  "name": "Multiplayer Tic Tac Toe",
+  "description": "Real-time multiplayer Tic Tac Toe with room codes, live opponent synchronization, spectator mode, and local play.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
